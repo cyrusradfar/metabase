@@ -1,115 +1,122 @@
 (ns metabase.test.data.h2
   "Code for creating / destroying an H2 database from a `DatabaseDefinition`."
-  (:require [clojure.java.io :as io]
-            [clojure.tools.logging :as log]
-            [clojure.string :as s]
-            (korma [core :as k]
-                   [db :as kdb])
-            (metabase.test.data [generic-sql :as generic]
-                                [interface :refer :all]))
-  (:import (metabase.test.data.interface DatabaseDefinition
-                                         FieldDefinition
-                                         TableDefinition)))
+  (:require [clojure.string :as str]
+            [metabase.db :as mdb]
+            [metabase.db.spec :as dbspec]
+            [metabase.driver.sql.util :as sql.u]
+            [metabase.models.database :refer [Database]]
+            [metabase.test.data
+             [impl :as data.impl]
+             [interface :as tx]
+             [sql :as sql.tx]
+             [sql-jdbc :as sql-jdbc.tx]]
+            [metabase.test.data.sql-jdbc
+             [execute :as execute]
+             [load-data :as load-data]
+             [spec :as spec]]
+            [toucan.db :as db]))
 
-(def ^:private ^:const field-base-type->sql-type
-  {:BigIntegerField "BIGINT"
-   :BooleanField    "BOOL"
-   :CharField       "VARCHAR(254)"
-   :DateField       "DATE"
-   :DateTimeField   "DATETIME"
-   :DecimalField    "DECIMAL"
-   :FloatField      "FLOAT"
-   :IntegerField    "INTEGER"
-   :TextField       "TEXT"
-   :TimeField       "TIME"})
+(sql-jdbc.tx/add-test-extensions! :h2)
 
-;; ## DatabaseDefinition helper functions
+(defonce ^:private h2-test-dbs-created-by-this-instance (atom #{}))
 
-(defn- connection-details
-  "Return a Metabase `Database.details` for H2 database defined by DATABASE-DEFINITION."
-  [^DatabaseDefinition {:keys [short-lived?], :as database-definition}]
-  {:db           (format "mem:%s" (escaped-name database-definition))
-   :short-lived? short-lived?})
+;; For H2, test databases are all in-memory, which don't work if they're saved from a different REPL session or the
+;; like. So delete any 'stale' in-mem DBs from the application DB when someone calls `get-or-create-database!` as
+;; needed.
+(defmethod data.impl/get-or-create-database! :h2
+  [driver dbdef]
+  (let [{:keys [database-name], :as dbdef} (tx/get-dataset-definition dbdef)]
+    ;; don't think we need to bother making this super-threadsafe because REPL usage and tests are more or less
+    ;; single-threaded
+    (when (not (contains? @h2-test-dbs-created-by-this-instance database-name))
+      (mdb/setup-db!) ; if not already setup
+      (db/delete! Database :engine "h2", :name database-name)
+      (swap! h2-test-dbs-created-by-this-instance conj database-name))
+    ((get-method data.impl/get-or-create-database! :default) driver dbdef)))
 
-(defn- korma-connection-pool
-  "Return an H2 korma connection pool to H2 database defined by DATABASE-DEFINITION."
-  [^DatabaseDefinition database-definition]
-  (kdb/create-db (kdb/h2 (assoc (connection-details database-definition)
-                                :naming {:keys   s/lower-case
-                                         :fields s/upper-case}))))
+(doseq [[base-type database-type] {:type/BigInteger     "BIGINT"
+                                   :type/Boolean        "BOOL"
+                                   :type/Date           "DATE"
+                                   :type/DateTime       "DATETIME"
+                                   :type/DateTimeWithTZ "TIMESTAMP WITH TIME ZONE"
+                                   :type/Decimal        "DECIMAL"
+                                   :type/Float          "FLOAT"
+                                   :type/Integer        "INTEGER"
+                                   :type/Text           "VARCHAR"
+                                   :type/Time           "TIME"}]
+  (defmethod sql.tx/field-base-type->sql-type [:h2 base-type] [_ _] database-type))
 
-;; ## Implementation
+(defmethod tx/dbdef->connection-details :h2
+  [_ context dbdef]
+  {:db (str "mem:" (tx/escaped-name dbdef) (when (= context :db)
+                                             ;; Return details with the GUEST user added so SQL queries are allowed.
+                                             ";USER=GUEST;PASSWORD=guest"))})
 
-(defn- format-for-h2 [obj]
-  (cond
-    (:database-name obj) (update-in obj [:table-definitions] (partial map format-for-h2))
-    (:table-name obj)    (-> obj
-                             (update-in [:table-name] s/upper-case)
-                             (update-in [:field-definitions] (partial map format-for-h2)))
-    (:field-name obj)    (cond-> (update-in obj [:field-name] s/upper-case)
-                           (:fk obj) (update-in [:fk] (comp s/upper-case name)))))
+(defmethod sql.tx/pk-sql-type :h2 [_] "BIGINT AUTO_INCREMENT")
 
+(defmethod sql.tx/pk-field-name :h2 [_] "ID")
 
-;; ## Public Concrete DatasetLoader instance
+(defmethod sql.tx/drop-db-if-exists-sql :h2 [& _] nil)
 
-;; For some reason this doesn't seem to work if we define IDatasetLoader methods inline, but does work when we explicitly use extend-protocol
-(defrecord H2DatasetLoader []
-  generic/IGenericSQLDatasetLoader
-  (generic/execute-sql! [_ database-definition raw-sql]
-    (log/debug raw-sql)
-    (k/exec-raw (korma-connection-pool database-definition) raw-sql))
+(defmethod sql.tx/create-db-sql :h2 [& _]
+  (str
+   ;; We don't need to actually do anything to create a database here. Just disable the undo
+   ;; log (i.e., transactions) for this DB session because the bulk operations to load data don't need to be atomic
+   "SET UNDO_LOG = 0;\n"
 
-  (generic/korma-entity [_ database-definition table-definition]
-    (-> (k/create-entity (:table-name table-definition))
-        (k/database (korma-connection-pool database-definition))))
+   ;; Create a non-admin account 'GUEST' which will be used from here on out
+   "CREATE USER IF NOT EXISTS GUEST PASSWORD 'guest';\n"
 
-  (generic/pk-sql-type   [_] "BIGINT AUTO_INCREMENT")
-  (generic/pk-field-name [_] "ID")
+   ;; Set DB_CLOSE_DELAY here because only admins are allowed to do it, so we can't set it via the connection string.
+   ;; Set it to to -1 (no automatic closing)
+   "SET DB_CLOSE_DELAY -1;"))
 
-  (generic/field-base-type->sql-type [_ field-type]
-    (field-base-type->sql-type field-type)))
+(defmethod sql.tx/create-table-sql :h2
+  [driver dbdef {:keys [table-name], :as tabledef}]
+  (str
+   ((get-method sql.tx/create-table-sql :sql-jdbc/test-extensions) driver dbdef tabledef)
+   ";\n"
+   ;; Grant the GUEST account r/w permissions for this table
+   (format "GRANT ALL ON %s TO GUEST;" (sql.u/quote-name driver :table (tx/format-name driver table-name)))))
 
+(defmethod tx/has-questionable-timezone-support? :h2 [_] true)
 
-(extend-protocol IDatasetLoader
-  H2DatasetLoader
-  (engine [_]
-    :h2)
+(defmethod tx/format-name :h2
+  [_ s]
+  (str/upper-case s))
 
-  (database->connection-details [_ database-definition]
-    ;; Return details with the GUEST user added so SQL queries are allowed.
-    (let [details (connection-details database-definition)]
-      (update details :db str ";USER=GUEST;PASSWORD=guest")))
+(defmethod tx/id-field-type :h2 [_] :type/BigInteger)
 
-  (drop-physical-db! [_ database-definition]
-    ;; Nothing to do here - there are no physical dbs <3
-    )
+(defmethod tx/aggregate-column-info :h2
+  ([driver ag-type]
+   ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type))
 
-  (create-physical-table! [this database-definition table-definition]
-    (generic/create-physical-table! this database-definition (format-for-h2 table-definition)))
+  ([driver ag-type field]
+   (merge
+    ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type field)
+    (when (= ag-type :sum)
+      {:base_type :type/BigInteger}))))
 
-  (create-physical-db! [this database-definition]
-    ;; Disable the undo log (i.e., transactions) for this DB session because the bulk operations to load data don't need to be atomic
-    (generic/execute-sql! this database-definition "SET UNDO_LOG = 0;")
+(defmethod execute/execute-sql! :h2
+  [driver _ dbdef sql]
+  ;; we always want to use 'server' context when execute-sql! is called (never
+  ;; try connect as GUEST, since we're not giving them priviledges to create
+  ;; tables / etc)
+  ((get-method execute/execute-sql! :sql-jdbc/test-extensions) driver :server dbdef sql))
 
-    ;; Create the "physical" database which in this case actually just means creating the schema
-    (generic/create-physical-db! this (format-for-h2 database-definition))
+;; Don't use the h2 driver implementation, which makes the connection string read-only & if-exists only
+(defmethod spec/dbdef->spec :h2
+  [driver context dbdef]
+  (dbspec/h2 (tx/dbdef->connection-details driver context dbdef)))
 
-    ;; Now create a non-admin account 'GUEST' which will be used from here on out
-    (generic/execute-sql! this database-definition "CREATE USER IF NOT EXISTS GUEST PASSWORD 'guest';")
-    ;; Grant the GUEST account SELECT permissions for all the Tables in this DB
-    (doseq [{:keys [table-name]} (:table-definitions database-definition)]
-      (generic/execute-sql! this database-definition (format "GRANT SELECT ON %s TO GUEST;" table-name)))
+(defmethod load-data/load-data! :h2
+  [& args]
+  (apply load-data/load-data-all-at-once! args))
 
-    ;; If this isn't a "short-lived" database we need to set DB_CLOSE_DELAY to -1 here because only admins are allowed to do it
-    ;; so we can't set it via the connection string :/
-    (when-not (:short-lived? database-definition)
-      (generic/execute-sql! this database-definition "SET DB_CLOSE_DELAY -1;")))
+(defmethod sql.tx/inline-column-comment-sql :h2
+  [& args]
+  (apply sql.tx/standard-inline-column-comment-sql args))
 
-  (load-table-data! [this database-definition table-definition]
-    (generic/load-table-data! this database-definition table-definition))
-
-  (drop-physical-table! [this database-definition table-definition]
-    (generic/drop-physical-table! this database-definition (format-for-h2 table-definition))))
-
-(defn dataset-loader []
-  (->H2DatasetLoader))
+(defmethod sql.tx/standalone-table-comment-sql :h2
+  [& args]
+  (apply sql.tx/standard-standalone-table-comment-sql args))

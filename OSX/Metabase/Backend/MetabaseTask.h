@@ -6,13 +6,19 @@
 //  Copyright (c) 2015 Metabase. All rights reserved.
 //
 
-@interface MetabaseTask : NSObject
+#import "JavaTask.h"
+
+/// Task for running the MetabaseServer
+@interface MetabaseTask : JavaTask
 
 /// Create (and launch) a task to run the Metabase backend server.
 + (MetabaseTask *)task;
 
 - (void)launch;
-- (void)terminate;
+
+/// Remove the task termination handler that pops up the 'Task died unexpectedly' alert.
+/// For cases when we want to kill the Metabase task without freaking the user out, e.g. for Reset Password
+- (void)disableTerminationAlert;
 
 - (NSUInteger)port;
 

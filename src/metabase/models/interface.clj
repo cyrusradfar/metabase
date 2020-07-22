@@ -1,235 +1,259 @@
 (ns metabase.models.interface
-  (:require (clojure.tools [logging :as log]
-                           [macro :refer [macrolet]])
-            [clojure.walk :refer [macroexpand-all], :as walk]
-            [cheshire.core :as cheshire]
-            [korma.core :as k]
-            [medley.core :as m]
-            [metabase.config :as config]
-            [metabase.util :as u]))
+  (:require [cheshire.core :as json]
+            [clojure.core.memoize :as memoize]
+            [clojure.tools.logging :as log]
+            [metabase.mbql.normalize :as normalize]
+            [metabase.util :as u]
+            [metabase.util
+             [cron :as cron-util]
+             [encryption :as encryption]
+             [i18n :refer [trs tru]]]
+            [potemkin.types :as p.types]
+            [schema.core :as s]
+            [taoensso.nippy :as nippy]
+            [toucan.models :as models])
+  (:import [java.io BufferedInputStream ByteArrayInputStream DataInputStream]
+           java.sql.Blob
+           java.util.zip.GZIPInputStream))
 
-;;; ## ---------------------------------------- PERMISSIONS CHECKING ----------------------------------------
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                               Toucan Extensions                                                |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defprotocol ICanReadWrite
-  (can-read?  [obj] [entity ^Integer id])
-  (can-write? [obj] [entity ^Integer id]))
-
-(defn- superuser? [& _]
-  (:is_superuser @@(resolve 'metabase.api.common/*current-user*)))
-
-(defn- owner?
-  ([{:keys [creator_id], :as obj}]
-   (assert creator_id "Can't check user permissions: object doesn't have :creator_id.")
-   (or (superuser?)
-       (= creator_id @(resolve 'metabase.api.common/*current-user-id*))))
-  ([entity id]
-   (or (superuser?)
-       (owner? (entity id)))))
-
-(defn- has-public-perms? [rw]
-  (let [perms (delay (require 'metabase.models.common)
-                     (case rw
-                       :r @(resolve 'metabase.models.common/perms-read)
-                       :w @(resolve 'metabase.models.common/perms-readwrite)))]
-    (fn -has-public-perms?
-      ([{:keys [public_perms], :as obj}]
-       (assert public_perms "Can't check user permissions: object doesn't have :public_perms.")
-       (or (owner? obj)
-           (>= public_perms @perms)))
-      ([entity id]
-       (or (owner? entity id)
-           (-has-public-perms? (entity id)))))))
-
-(defn extend-ICanReadWrite
-  "Add standard implementations of `can-read?` and `can-write?` to KLASS."
-  [klass & {:keys [read write]}]
-  (let [key->method (fn [rw v]
-                      (case v
-                        :always       (constantly true)
-                        :public-perms (has-public-perms? rw)
-                        :owner        #'owner?
-                        :superuser    #'superuser?))]
-    (extend klass
-      ICanReadWrite {:can-read?  (key->method :r read)
-                     :can-write? (key->method :w write)})))
+(models/set-root-namespace! 'metabase.models)
 
 
-;;; ## ---------------------------------------- ENTITIES ----------------------------------------
+;;; types
 
-(defprotocol IEntity
-  (pre-insert [this instance]
-    "Gets called by `ins` immediately before inserting a new object immediately before the korma `insert` call.
-     This provides an opportunity to do things like encode JSON or provide default values for certain fields.
-
-         (pre-insert [_ query]
-           (let [defaults {:version 1}]
-             (merge defaults query))) ; set some default values")
-
-  (post-insert [this instance]
-    "Gets called by `ins` after an object is inserted into the DB. (This object is fetched via `sel`).
-     A good place to do asynchronous tasks such as creating related objects.
-     Implementations should return the newly created object.")
-
-  (pre-update [this instance]
-    "Called by `upd` before DB operations happen. A good place to set updated values for fields like `updated_at`, or serialize maps into JSON.")
-
-  (post-update [this instance]
-    "Called by `upd` after a SQL `UPDATE` *succeeds*. (This gets called with whatever the output of `pre-update` was).
-
-     A good place to schedule asynchronous tasks, such as creating a `FieldValues` object for a `Field`
-     when it is marked with `special_type` `:category`.
-
-     The output of this function is ignored.")
-
-  (post-select [this instance]
-    "Called on the results from a call to `sel`. Default implementation doesn't do anything, but
-     you can provide custom implementations to do things like add hydrateable keys or remove sensitive fields.")
-
-  (pre-cascade-delete [this instance]
-    "Called by `cascade-delete` for each matching object that is about to be deleted.
-     Implementations should delete any objects related to this object by recursively
-     calling `cascade-delete`.
-
-     The output of this function is ignored.
-
-        (pre-cascade-delete [_ {database-id :id :as database}]
-          (cascade-delete Card :database_id database-id)
-          ...)")
-
-  (internal-pre-insert  [this instance])
-  (internal-pre-update  [this instance])
-  (internal-post-select [this instance]))
-
-(defn- identity-second [_ obj] obj)
-(def ^:private constantly-nil (constantly nil))
-
-(def ^:const ^:private default-entity-method-implementations
-  {:pre-insert         #'identity-second
-   :post-insert        #'identity-second
-   :pre-update         #'identity-second
-   :post-update        #'constantly-nil
-   :post-select        #'identity-second
-   :pre-cascade-delete #'constantly-nil})
-
-;; ## ---------------------------------------- READ-JSON ----------------------------------------
-
-(defn- read-json-str-or-clob
-  "If JSON-STRING is a JDBC Clob, convert to a String. Then call `json/read-str`."
-  [json-str]
-  (some-> (u/jdbc-clob->str json-str)
-          cheshire/parse-string))
-
-(defn- read-json
-  "Read JSON-STRING (or JDBC Clob) as JSON and keywordize keys."
-  [json-string]
-  (->> (read-json-str-or-clob json-string)
-       walk/keywordize-keys))
-
-(defn- write-json
-  "If OBJ is not already a string, encode it as JSON."
+(defn json-in
+  "Default in function for columns given a Toucan type `:json`. Serializes object as JSON."
   [obj]
-  (if (string? obj) obj
-      (cheshire/generate-string obj)))
+  (if (string? obj)
+    obj
+    (json/generate-string obj)))
 
-(def ^:const ^:private type-fns
-  {:json    {:in  #'write-json
-             :out #'read-json}
-   :keyword {:in  `name
-             :out `keyword}})
+(defn- json-out [s keywordize-keys?]
+  (if (string? s)
+    (try
+      (json/parse-string s keywordize-keys?)
+      (catch Throwable e
+        (log/error e (str (trs "Error parsing JSON")))
+        s))
+    s))
 
-(defmacro apply-type-fns [obj-binding direction entity-map]
-  {:pre [(symbol? obj-binding)
-         (keyword? direction)
-         (map? entity-map)]}
-  (let [fns (m/map-vals #(direction (type-fns %)) (::types entity-map))]
-    (if-not (seq fns) obj-binding
-            `(cond-> ~obj-binding
-               ~@(mapcat (fn [[k f]]
-                           [`(~k ~obj-binding) `(update-in [~k] ~f)])
-                         fns)))))
+(defn json-out-with-keywordization
+  "Default out function for columns given a Toucan type `:json`. Parses serialized JSON string and keywordizes keys."
+  [obj]
+  (json-out obj true))
 
-(defn -invoke-entity
-  "Basically the same as `(sel :one Entity :id id)`." ; TODO - deduplicate with sel
-  [entity id]
-  (when id
-    (when (metabase.config/config-bool :mb-db-logging)
-      (when-not @(resolve 'metabase.db/*sel-disable-logging*)
-        (clojure.tools.logging/debug
-         "DB CALL: " (:name entity) id)))
-    (let [[obj] (k/select (assoc entity :fields (::default-fields entity))
-                          (k/where {:id id})
-                          (k/limit 1))]
-      (some->> obj
-               (internal-post-select entity)
-               (post-select entity)))))
+(defn json-out-without-keywordization
+  "Out function for columns given a Toucan type `:json-no-keywordization`. Similar to `:json-out` but does leaves keys
+  as strings."
+  [obj]
+  (json-out obj false))
 
-(defn- update-updated-at [obj]
-  (assoc obj :updated_at (u/new-sql-timestamp)))
+(models/add-type! :json
+  :in  json-in
+  :out json-out-with-keywordization)
 
-(defn- update-created-at-updated-at [obj]
-  (let [ts (u/new-sql-timestamp)]
-    (assoc obj :created_at ts, :updated_at ts)))
+(models/add-type! :json-no-keywordization
+  :in  json-in
+  :out json-out-without-keywordization)
 
-(defmacro macrolet-entity-map [entity & entity-forms]
-  `(macrolet [(~'default-fields [m# & fields#]       `(assoc ~m# ::default-fields [~@(map keyword fields#)]))
-              (~'timestamped    [m#]                 `(assoc ~m# ::timestamped true))
-              (~'types          [m# & {:as fields#}] `(assoc ~m# ::types ~fields#))
-              (~'hydration-keys [m# & fields#]       `(assoc ~m# ::hydration-keys #{~@(map keyword fields#)}))]
-     (-> (k/create-entity ~(name entity))
-         ~@entity-forms)))
+;; `metabase-query` type is for *outer* queries like Card.dataset_query. Normalizes them on the way in & out
+(defn- maybe-normalize [query]
+  (cond-> query
+    (seq query) normalize/normalize))
 
-(defmacro defentity
-  "Similar to korma `defentity`, but creates a new record type where you can specify protocol implementations."
-  [entity entity-forms & methods+specs]
-  {:pre [(vector? entity-forms)]}
-  (let [entity-symb               (symbol (format "%sEntity" (name entity)))
-        internal-post-select-symb (symbol (format "internal-post-select-%s" (name entity)))
-        unevaled-entity-map       (macroexpand-all `(macrolet-entity-map ~entity ~@entity-forms))
-        entity-map                (eval unevaled-entity-map)
-        [methods specs]           (split-with list? methods+specs)]
-    `(do
-       (defrecord ~entity-symb []
-         clojure.lang.IFn
-         (~'invoke [~'this ~'id]
-           (-invoke-entity ~'this ~'id))
+(defn- catch-normalization-exceptions
+  "Wraps normalization fn `f` and returns a version that gracefully handles Exceptions during normalization. When
+  invalid queries (etc.) come out of the Database, it's best we handle normalization failures gracefully rather than
+  letting the Exception cause the entire API call to fail because of one bad object. (See #8914 for more details.)"
+  [f]
+  (fn [query]
+    (try
+      (doall (f query))
+      (catch Throwable e
+        (log/error e (tru "Unable to normalize:") "\n"
+                   (u/pprint-to-str 'red query))
+        nil))))
 
-         ~@specs)
+(models/add-type! :metabase-query
+  :in  (comp json-in maybe-normalize)
+  :out (comp (catch-normalization-exceptions maybe-normalize) json-out-with-keywordization))
 
-       (extend ~entity-symb
-         IEntity ~(merge default-entity-method-implementations
-                         {:internal-pre-insert  `(fn [~'_ obj#]
-                                                   (-> obj#
-                                                       (apply-type-fns :in ~entity-map)
-                                                       ~@(when (::timestamped entity-map)
-                                                           [update-created-at-updated-at])))
-                          :internal-pre-update  `(fn [~'_ obj#]
-                                                   (-> obj#
-                                                       (apply-type-fns :in ~entity-map)
-                                                       ~@(when (::timestamped entity-map)
-                                                           [update-updated-at])))
-                          :internal-post-select `(fn [~'_ obj#]
-                                                   (apply-type-fns obj# :out ~entity-map))}
-                         (into {}
-                               (for [[method-name & impl] methods]
-                                 {(keyword method-name) `(fn ~@impl)}))))
-       (def ~entity
-         (~(symbol (format "map->%sEntity" (name entity))) (assoc ~unevaled-entity-map ::entity true))))))
+;; `metric-segment-definition` is, predictably, for Metric/Segment `:definition`s, which are just the inner MBQL query
+(defn- normalize-metric-segment-definition [definition]
+  (when definition
+    (normalize/normalize-fragment [:query] definition)))
 
-(defn metabase-entity?
-  "Is ENTITY a valid metabase model entity?"
-  [entity]
-  (::entity entity))
+;; For inner queries like those in Metric definitions
+(models/add-type! :metric-segment-definition
+  :in  (comp json-in normalize-metric-segment-definition)
+  :out (comp (catch-normalization-exceptions normalize-metric-segment-definition) json-out-with-keywordization))
+
+;; For DashCard parameter lists
+(defn- normalize-parameter-mapping-targets [parameter-mappings]
+  (or (normalize/normalize-fragment [:parameters] parameter-mappings)
+      []))
+
+(models/add-type! :parameter-mappings
+  :in  (comp json-in normalize-parameter-mapping-targets)
+  :out (comp (catch-normalization-exceptions normalize-parameter-mapping-targets) json-out-with-keywordization))
 
 
-;;; # ---------------------------------------- INSTANCE ----------------------------------------
+;; json-set is just like json but calls `set` on it when coming out of the DB. Intended for storing things like a
+;; permissions set
+(models/add-type! :json-set
+  :in  json-in
+  :out #(some-> % json-out-with-keywordization set))
 
-(defprotocol IModelInstanceApiSerialize
-  (api-serialize [this]
-    "Called on all objects being written out by the API. Default implementations return THIS as-is, but models can provide
-     custom methods to strip sensitive data, from non-admins, etc."))
+(def ^:private encrypted-json-in  (comp encryption/maybe-encrypt json-in))
+(def ^:private encrypted-json-out (comp json-out-with-keywordization encryption/maybe-decrypt))
 
-(extend Object
-  IModelInstanceApiSerialize {:api-serialize identity})
+;; cache the decryption/JSON parsing because it's somewhat slow (~500µs vs ~100µs on a *fast* computer)
+;; cache the decrypted JSON for one hour
+(def ^:private cached-encrypted-json-out (memoize/ttl encrypted-json-out :ttl/threshold (* 60 60 1000)))
 
-(extend nil
-  IModelInstanceApiSerialize {:api-serialize identity})
+(models/add-type! :encrypted-json
+  :in  encrypted-json-in
+  :out cached-encrypted-json-out)
+
+(models/add-type! :encrypted-text
+  :in  encryption/maybe-encrypt
+  :out encryption/maybe-decrypt)
+
+(defn decompress
+  "Decompress `compressed-bytes`."
+  [compressed-bytes]
+  (if (instance? Blob compressed-bytes)
+    (recur (.getBytes ^Blob compressed-bytes 0 (.length ^Blob compressed-bytes)))
+    (with-open [bis     (ByteArrayInputStream. compressed-bytes)
+                bif     (BufferedInputStream. bis)
+                gz-in   (GZIPInputStream. bif)
+                data-in (DataInputStream. gz-in)]
+      (nippy/thaw-from-in! data-in))))
+
+(models/add-type! :compressed
+  :in  identity
+  :out decompress)
+
+(defn- validate-cron-string [s]
+  (s/validate (s/maybe cron-util/CronScheduleString) s))
+
+(models/add-type! :cron-string
+  :in  validate-cron-string
+  :out identity)
+
+;; Toucan ships with a Keyword type, but on columns that are marked 'TEXT' it doesn't work properly since the values
+;; might need to get de-CLOB-bered first. So replace the default Toucan `:keyword` implementation with one that
+;; handles those cases.
+(models/add-type! :keyword
+  :in  u/qualified-name
+  :out keyword)
+
+;;; properties
+
+(defn- add-created-at-timestamp [obj & _]
+  (assoc obj :created_at :%now))
+
+(defn- add-updated-at-timestamp [obj & _]
+  (assoc obj :updated_at :%now))
+
+(models/add-property! :timestamped?
+  :insert (comp add-created-at-timestamp add-updated-at-timestamp)
+  :update add-updated-at-timestamp)
+
+;; like `timestamped?`, but for models that only have an `:updated_at` column
+(models/add-property! :updated-at-timestamped?
+  :insert add-updated-at-timestamp
+  :update add-updated-at-timestamp)
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                             New Permissions Stuff                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(p.types/defprotocol+ IObjectPermissions
+  "Methods for determining whether the current user has read/write permissions for a given object."
+
+  (perms-objects-set [this, ^clojure.lang.Keyword read-or-write]
+    "Return a set of permissions object paths that a user must have access to in order to access this object. This
+    should be something like #{\"/db/1/schema/public/table/20/\"}. READ-OR-WRITE will be either `:read` or `:write`,
+    depending on which permissions set we're fetching (these will be the same sets for most models; they can ignore
+    this param).")
+
+  (can-read? ^Boolean [instance], ^Boolean [entity, ^Integer id]
+    "Return whether `*current-user*` has *read* permissions for an object. You should use one of these implmentations:
+
+     *  `(constantly true)`
+     *  `superuser?`
+     *  `(partial current-user-has-full-permissions? :read)` (you must also implement `perms-objects-set` to use this)
+     *  `(partial current-user-has-partial-permissions? :read)` (you must also implement `perms-objects-set` to use
+        this)")
+
+  (^{:hydrate :can_write} can-write? ^Boolean [instance], ^Boolean [entity, ^Integer id]
+   "Return whether `*current-user*` has *write* permissions for an object. You should use one of these implmentations:
+
+     *  `(constantly true)`
+     *  `superuser?`
+     *  `(partial current-user-has-full-permissions? :write)` (you must also implement `perms-objects-set` to use this)
+     *  `(partial current-user-has-partial-permissions? :write)` (you must also implement `perms-objects-set` to use
+        this)")
+
+  (^{:added "0.32.0"} can-create? ^Boolean [entity m]
+    "NEW! Check whether or not current user is allowed to CREATE a new instance of `entity` with properties in map
+    `m`.
+
+    Because this method was added YEARS after `can-read?` and `can-write?`, most models do not have an implementation
+    for this method, and instead `POST` API endpoints themselves contain the appropriate permissions logic (ick).
+    Implement this method as you come across models that are missing it."))
+
+(def IObjectPermissionsDefaults
+  "Default implementations for `IObjectPermissions`."
+  {:perms-objects-set
+   (constantly nil)
+
+   :can-create?
+   (fn [entity _]
+     (throw
+      (NoSuchMethodException.
+       (format "%s does not yet have an implementation for `can-create?`. Feel free to add one!" (name entity)))))})
+
+(defn superuser?
+  "Is `*current-user*` is a superuser? Ignores args.
+   Intended for use as an implementation of `can-read?` and/or `can-write?`."
+  [& _]
+  @(resolve 'metabase.api.common/*is-superuser?*))
+
+
+(defn- current-user-permissions-set []
+  @@(resolve 'metabase.api.common/*current-user-permissions-set*))
+
+(defn- current-user-has-root-permissions? ^Boolean []
+  (contains? (current-user-permissions-set) "/"))
+
+(defn- make-perms-check-fn [perms-check-fn-symb]
+  (fn -has-perms?
+    ([read-or-write entity object-id]
+     (or (current-user-has-root-permissions?)
+         (-has-perms? read-or-write (entity object-id))))
+    ([read-or-write object]
+     (and object
+          (-has-perms? (perms-objects-set object read-or-write))))
+    ([perms-set]
+     ((resolve perms-check-fn-symb) (current-user-permissions-set) perms-set))))
+
+(def ^{:arglists '([read-or-write entity object-id] [read-or-write object] [perms-set])}
+  ^Boolean current-user-has-full-permissions?
+  "Implementation of `can-read?`/`can-write?` for the old permissions system. `true` if the current user has *full*
+  permissions for the paths returned by its implementation of `perms-objects-set`. (READ-OR-WRITE is either `:read` or
+  `:write` and passed to `perms-objects-set`; you'll usually want to partially bind it in the implementation map)."
+  (make-perms-check-fn 'metabase.models.permissions/set-has-full-permissions-for-set?))
+
+(def ^{:arglists '([read-or-write entity object-id] [read-or-write object] [perms-set])}
+  ^Boolean current-user-has-partial-permissions?
+  "Implementation of `can-read?`/`can-write?` for the old permissions system. `true` if the current user has *partial*
+  permissions for the paths returned by its implementation of `perms-objects-set`. (READ-OR-WRITE is either `:read` or
+  `:write` and passed to `perms-objects-set`; you'll usually want to partially bind it in the implementation map)."
+  (make-perms-check-fn 'metabase.models.permissions/set-has-partial-permissions-for-set?))

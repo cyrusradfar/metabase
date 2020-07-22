@@ -1,28 +1,20 @@
 (ns metabase.models.view-log
-  (:require [korma.core :refer :all, :exclude [defentity update]]
-            [metabase.api.common :refer [*current-user-id*]]
-            [metabase.db :refer :all]
-            [metabase.events :as events]
-            (metabase.models [card :refer [Card]]
-                             [dashboard :refer [Dashboard]]
-                             [interface :refer :all]
-                             [user :refer [User]])
-            [metabase.util :as u]))
+  "The ViewLog is used to log an event where a given User views a given object such as a Table or Card (Question)."
+  (:require [metabase.models.interface :as i]
+            [metabase.util :as u]
+            [toucan.models :as models]))
 
+(models/defmodel ViewLog :view_log)
 
-(defrecord ViewLogItemInstance []
-  clojure.lang.IFn
-  (invoke [this k]
-    (get this k)))
+(defn- pre-insert [log-entry]
+  (let [defaults {:timestamp :%now}]
+    (merge defaults log-entry)))
 
-(extend-ICanReadWrite ViewLogItemInstance :read :public-perms, :write :public-perms)
-
-
-(defentity ViewLog
-           [(table :view_log)]
-
-           (pre-insert [_ log-entry]
-                       (let [defaults {:timestamp (u/new-sql-timestamp)}]
-                         (merge defaults log-entry))))
-
-(extend-ICanReadWrite ViewLogEntity :read :public-perms, :write :public-perms)
+(u/strict-extend (class ViewLog)
+  models/IModel
+  (merge models/IModelDefaults
+         {:pre-insert pre-insert})
+  i/IObjectPermissions
+  (merge i/IObjectPermissionsDefaults
+         {:can-read?  (constantly true)
+          :can-write? (constantly true)}))

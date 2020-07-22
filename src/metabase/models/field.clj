@@ -1,149 +1,292 @@
 (ns metabase.models.field
-  (:require [korma.core :refer :all, :exclude [defentity update]]
-            [metabase.api.common :refer [check]]
-            [metabase.db :refer :all]
-            (metabase.models [common :as common]
-                             [database :refer [Database]]
-                             [field-values :refer [FieldValues field-should-have-field-values? create-field-values-if-needed]]
-                             [foreign-key :refer [ForeignKey]]
-                             [hydrate :refer [hydrate]]
-                             [interface :refer :all])
-            [metabase.util :as u]))
+  (:require [clojure.core.memoize :as memoize]
+            [clojure.string :as str]
+            [medley.core :as m]
+            [metabase.models
+             [dimension :refer [Dimension]]
+             [field-values :as fv :refer [FieldValues]]
+             [humanization :as humanization]
+             [interface :as i]
+             [permissions :as perms]]
+            [metabase.util :as u]
+            [toucan
+             [db :as db]
+             [hydrate :refer [hydrate]]
+             [models :as models]]))
 
-(declare field->fk-field
-         qualified-name-components)
+;;; ------------------------------------------------- Type Mappings --------------------------------------------------
 
-(def ^:const special-types
-  "Possible values for `Field.special_type`."
-  #{:avatar
-    :category
-    :city
-    :country
-    :desc
-    :fk
-    :id
-    :image
-    :json
-    :latitude
-    :longitude
-    :name
-    :number
-    :state
-    :timestamp_milliseconds
-    :timestamp_seconds
-    :url
-    :zip_code})
+(def visibility-types
+  "Possible values for `Field.visibility_type`."
+  #{:normal         ; Default setting.  field has no visibility restrictions.
+    :details-only   ; For long blob like columns such as JSON.  field is not shown in some places on the frontend.
+    :hidden         ; Lightweight hiding which removes field as a choice in most of the UI.  should still be returned in queries.
+    :sensitive      ; Strict removal of field from all places except data model listing.  queries should error if someone attempts to access.
+    :retired})      ; For fields that no longer exist in the physical db.  automatically set by Metabase.  QP should error if encountered in a query.
 
-(def ^:const base-types
-  "Possible values for `Field.base_type`."
-  #{:BigIntegerField
-    :BooleanField
-    :CharField
-    :DateField
-    :DateTimeField
-    :DecimalField
-    :DictionaryField
-    :FloatField
-    :IntegerField
-    :TextField
-    :TimeField
-    :UUIDField      ; e.g. a Postgres 'UUID' column
-    :UnknownField})
-
-(def ^:const field-types
-  "Possible values for `Field.field_type`."
-  #{:metric      ; A number that can be added, graphed, etc.
-    :dimension   ; A high or low-cardinality numerical string value that is meant to be used as a grouping
-    :info        ; Non-numerical value that is not meant to be used
-    :sensitive}) ; A Fields that should *never* be shown *anywhere*
-
-(defrecord FieldInstance []
-  clojure.lang.IFn
-  (invoke [this k]
-    (get this k)))
-
-(extend-ICanReadWrite FieldInstance :read :always, :write :superuser)
+(def has-field-values-options
+  "Possible options for `has_field_values`. This column is used to determine whether we keep FieldValues for a Field,
+  and which type of widget should be used to pick values of this Field when filtering by it in the Query Builder."
+  ;; AUTOMATICALLY-SET VALUES, SET DURING SYNC
+  ;;
+  ;; `nil` -- means infer which widget to use based on logic in `with-has-field-values`; this will either return
+  ;; `:search` or `:none`.
+  ;;
+  ;; This is the default state for Fields not marked `auto-list`. Admins cannot explicitly mark a Field as
+  ;; `has_field_values` `nil`. This value is also subject to automatically change in the future if the values of a
+  ;; Field change in such a way that it can now be marked `auto-list`. Fields marked `nil` do *not* have FieldValues
+  ;; objects.
+  ;;
+  #{;; The other automatically-set option. Automatically marked as a 'List' Field based on cardinality and other factors
+    ;; during sync. Store a FieldValues object; use the List Widget. If this Field goes over the distinct value
+    ;; threshold in a future sync, the Field will get switched back to `has_field_values = nil`.
+    :auto-list
+    ;;
+    ;; EXPLICITLY-SET VALUES, SET BY AN ADMIN
+    ;;
+    ;; Admin explicitly marked this as a 'Search' Field, which means we should *not* keep FieldValues, and should use
+    ;; Search Widget.
+    :search
+    ;; Admin explicitly marked this as a 'List' Field, which means we should keep FieldValues, and use the List
+    ;; Widget. Unlike `auto-list`, if this Field grows past the normal cardinality constraints in the future, it will
+    ;; remain `List` until explicitly marked otherwise.
+    :list
+    ;; Admin explicitly marked that this Field shall always have a plain-text widget, neither allowing search, nor
+    ;; showing a list of possible values. FieldValues not kept.
+    :none})
 
 
-(defentity Field
-  [(table :metabase_field)
-   (hydration-keys destination field origin)
-   (types :base_type :keyword, :field_type :keyword, :special_type :keyword)
-   timestamped]
+;;; ----------------------------------------------- Entity & Lifecycle -----------------------------------------------
 
-  (pre-insert [_ field]
-    (let [defaults {:active          true
-                    :preview_display true
-                    :field_type      :info
-                    :position        0
-                    :display_name    (common/name->human-readable-name (:name field))}]
-      (merge defaults field)))
+(models/defmodel Field :metabase_field)
 
-  (post-insert [_ field]
-    (when (field-should-have-field-values? field)
-      (create-field-values-if-needed field))
-    field)
+(defn- check-valid-types [{base-type :base_type, special-type :special_type}]
+  (when base-type
+    (assert (isa? (keyword base-type) :type/*)
+      (str "Invalid base type: " base-type)))
+  (when special-type
+    (assert (isa? (keyword special-type) :type/*)
+      (str "Invalid special type: " special-type))))
 
-  (post-update [this {:keys [id] :as field}]
-    ;; if base_type or special_type were affected then we should asynchronously create corresponding FieldValues objects if need be
-    (when (or (contains? field :base_type)
-              (contains? field :field_type)
-              (contains? field :special_type))
-      (create-field-values-if-needed (sel :one [this :id :table_id :base_type :special_type :field_type] :id id))))
+(defn- pre-insert [field]
+  (check-valid-types field)
+  (let [defaults {:display_name (humanization/name->human-readable-name (:name field))}]
+    (merge defaults field)))
 
-  (post-select [this {:keys [id table_id parent_id] :as field}]
-    (map->FieldInstance
-      (u/assoc* field
-        :table                     (delay (sel :one 'metabase.models.table/Table :id table_id))
-        :db                        (delay @(:db @(:table <>)))
-        :target                    (delay (field->fk-field field))
-        :parent                    (when parent_id
-                                     (delay (this parent_id)))
-        :children                  (delay (sel :many this :parent_id (:id field)))
-        :values                    (delay (sel :many [FieldValues :field_id :values] :field_id id))
-        :qualified-name-components (delay (qualified-name-components <>))
-        :qualified-name            (delay (apply str (interpose "." @(:qualified-name-components <>)))))))
+(defn- pre-update [field]
+  (u/prog1 field
+    (check-valid-types field)))
 
-  (pre-cascade-delete [this {:keys [id]}]
-    (cascade-delete this :parent_id id)
-    (cascade-delete ForeignKey (where (or (= :origin_id id)
-                                          (= :destination_id id))))
-    (cascade-delete 'metabase.models.field-values/FieldValues :field_id id)))
+;;; Field permissions
+;; There are several API endpoints where large instances can return many thousands of Fields. Normally Fields require
+;; a DB call to fetch information about their Table, because a Field's permissions set is the same as its parent
+;; Table's. To make API endpoints perform well, we have use two strategies:
+;; 1)  If a Field's Table is already hydrated, there is no need to manually fetch the information a second time
+;; 2)  Failing that, we cache the corresponding permissions sets for each *Table ID* for a few seconds to minimize the
+;;     number of DB calls that are made. See discussion below for more details.
 
-(extend-ICanReadWrite FieldEntity :read :always, :write :superuser)
+(def ^:private ^{:arglists '([table-id])} perms-objects-set*
+  "Cached lookup for the permissions set for a table with TABLE-ID. This is done so a single API call or other unit of
+   computation doesn't accidentally end up in a situation where thousands of DB calls end up being made to calculate
+   permissions for a large number of Fields. Thus, the cache only persists for 5 seconds.
+
+   Of course, no DB lookups are needed at all if the Field already has a hydrated Table. However, mistakes are
+   possible, and I did not extensively audit every single code pathway that uses sequences of Fields and permissions,
+   so this caching is added as a failsafe in case Table hydration wasn't done.
+
+   Please note this only caches one entry PER TABLE ID. Thus, even a million Tables (which is more than I hope we ever
+   see), would require only a few megs of RAM, and again only if every single Table was looked up in a span of 5
+   seconds."
+  (memoize/ttl
+   (fn [table-id]
+     (let [{schema :schema, database-id :db_id} (db/select-one ['Table :schema :db_id] :id table-id)]
+       #{(perms/object-path database-id schema table-id)}))
+   :ttl/threshold 5000))
+
+(defn- perms-objects-set
+  "Calculate set of permissions required to access a Field. For the time being permissions to access a Field are the
+   same as permissions to access its parent Table, and there are not separate permissions for reading/writing."
+  [{table-id :table_id, {db-id :db_id, schema :schema} :table} _]
+  {:arglists '([field read-or-write])}
+  (if db-id
+    ;; if Field already has a hydrated `:table`, then just use that to generate perms set (no DB calls required)
+    #{(perms/object-path db-id schema table-id)}
+    ;; otherwise we need to fetch additional info about Field's Table. This is cached for 5 seconds (see above)
+    (perms-objects-set* table-id)))
+
+(defn- maybe-parse-special-numeric-values [maybe-double-value]
+  (if (string? maybe-double-value)
+    (u/ignore-exceptions (Double/parseDouble maybe-double-value))
+    maybe-double-value))
+
+(defn- update-special-numeric-values
+  "When fingerprinting decimal columns, NaN and Infinity values are possible. Serializing these values to JSON just
+  yields a string, not a value double. This function will attempt to coerce any of those values to double objects"
+  [fingerprint]
+  (m/update-existing-in fingerprint [:type :type/Number]
+                        (partial m/map-vals maybe-parse-special-numeric-values)))
+
+(models/add-type! :json-for-fingerprints
+  :in  i/json-in
+  :out (comp update-special-numeric-values i/json-out-with-keywordization))
 
 
-(defn field->fk-field
-  "Attempts to follow a `ForeignKey` from the the given `Field` to a destination `Field`.
+(u/strict-extend (class Field)
+  models/IModel
+  (merge models/IModelDefaults
+         {:hydration-keys (constantly [:destination :field :origin :human_readable_field])
+          :types          (constantly {:base_type        :keyword
+                                       :special_type     :keyword
+                                       :visibility_type  :keyword
+                                       :has_field_values :keyword
+                                       :fingerprint      :json-for-fingerprints
+                                       :settings         :json})
+          :properties     (constantly {:timestamped? true})
+          :pre-insert     pre-insert
+          :pre-update     pre-update})
 
-   Only evaluates if the given field has :special_type `fk`, otherwise does nothing."
-  [{:keys [id special_type] :as field}]
-  (when (= :fk special_type)
-    (let [dest-id (sel :one :field [ForeignKey :destination_id] :origin_id id)]
-      (Field dest-id))))
+  i/IObjectPermissions
+  (merge i/IObjectPermissionsDefaults
+         {:perms-objects-set perms-objects-set
+          :can-read?         (partial i/current-user-has-full-permissions? :read)
+          :can-write?        i/superuser?}))
 
-(defn unflatten-nested-fields
-  "Take a sequence of both top-level and nested FIELDS, and return a sequence of top-level `Fields`
-   with nested `Fields` moved into sequences keyed by `:children` in their parents.
 
-     (unflatten-nested-fields [{:id 1, :parent_id nil}, {:id 2, :parent_id 1}])
-       -> [{:id 1, :parent_id nil, :children [{:id 2, :parent_id 1, :children nil}]}]
+;;; ---------------------------------------------- Hydration / Util Fns ----------------------------------------------
 
-   You may optionally specify a different PARENT-ID-KEY; the default is `:parent_id`."
-  ([fields]
-   (unflatten-nested-fields fields :parent_id))
-  ([fields parent-id-key]
-   (let [parent-id->fields (group-by parent-id-key fields)
-         resolve-children  (fn resolve-children [field]
-                             (assoc field :children (map resolve-children
-                                                         (parent-id->fields (:id field)))))]
-     (map resolve-children (parent-id->fields nil)))))
+(defn target
+  "Return the FK target `Field` that this `Field` points to."
+  [{:keys [special_type fk_target_field_id]}]
+  (when (and (isa? special_type :type/FK)
+             fk_target_field_id)
+    (Field fk_target_field_id)))
 
-(defn- qualified-name-components
+(defn values
+  "Return the `FieldValues` associated with this FIELD."
+  [{:keys [id]}]
+  (db/select [FieldValues :field_id :values], :field_id id))
+
+(defn- select-field-id->instance
+  "Select instances of `model` related by `field_id` FK to a Field in `fields`, and return a map of Field ID -> model
+  instance. This only returns a single instance for each Field! Duplicates are discarded!
+
+    (select-field-id->instance [(Field 1) (Field 2)] FieldValues)
+    ;; -> {1 #FieldValues{...}, 2 #FieldValues{...}}"
+  [fields model]
+  (let [field-ids (set (map :id fields))]
+    (u/key-by :field_id (when (seq field-ids)
+                          (db/select model :field_id [:in field-ids])))))
+
+(defn with-values
+  "Efficiently hydrate the `FieldValues` for a collection of FIELDS."
+  {:batched-hydrate :values}
+  [fields]
+  (let [id->field-values (select-field-id->instance fields FieldValues)]
+    (for [field fields]
+      (assoc field :values (get id->field-values (:id field) [])))))
+
+(defn with-normal-values
+  "Efficiently hydrate the `FieldValues` for visibility_type normal FIELDS."
+  {:batched-hydrate :normal_values}
+  [fields]
+  (let [id->field-values (select-field-id->instance (filter fv/field-should-have-field-values? fields)
+                                                    [FieldValues :id :human_readable_values :values :field_id])]
+    (for [field fields]
+      (assoc field :values (get id->field-values (:id field) [])))))
+
+(defn with-dimensions
+  "Efficiently hydrate the `Dimension` for a collection of FIELDS."
+  {:batched-hydrate :dimensions}
+  [fields]
+  ;; TODO - it looks like we obviously thought this code would return *all* of the Dimensions for a Field, not just
+  ;; one! This code is obviously wrong! It will either assoc a single Dimension or an empty vector under the
+  ;; `:dimensions` key!!!!
+  ;; TODO - consult with tom and see if fixing this will break any hacks that surely must exist in the frontend to deal
+  ;; with this
+  (let [id->dimensions (select-field-id->instance fields Dimension)]
+    (for [field fields]
+      (assoc field :dimensions (get id->dimensions (:id field) [])))))
+
+(defn- is-searchable?
+  "Is this `field` a Field that you should be presented with a search widget for (to search its values)? If so, we can
+  give it a `has_field_values` value of `search`."
+  [{base-type :base_type}]
+  ;; For the time being we will consider something to be "searchable" if it's a text Field since the `starts-with`
+  ;; filter that powers the search queries (see `metabase.api.field/search-values`) doesn't work on anything else
+  (or (isa? base-type :type/Text)
+      (isa? base-type :type/TextLike)))
+
+(defn- infer-has-field-values
+  "Determine the value of `has_field_values` we should return for a `Field` As of 0.29.1 this doesn't require any DB
+  calls! :D"
+  [{has-field-values :has_field_values, :as field}]
+  (or
+   ;; if `has_field_values` is set in the DB, use that value; but if it's `auto-list`, return the value as `list` to
+   ;; avoid confusing FE code, which can remain blissfully unaware that `auto-list` is a thing
+   (when has-field-values
+     (if (= (keyword has-field-values) :auto-list)
+       :list
+       has-field-values))
+   ;; otherwise if it does not have value set in DB we will infer it
+   (if (is-searchable? field)
+     :search
+     :none)))
+
+(defn with-has-field-values
+  "Infer what the value of the `has_field_values` should be for Fields where it's not set. See documentation for
+  `has-field-values-options` above for a more detailed explanation of what these values mean."
+  {:batched-hydrate :has_field_values}
+  [fields]
+  (for [field fields]
+    (when field
+      (assoc field :has_field_values (infer-has-field-values field)))))
+
+(defn readable-fields-only
+  "Efficiently checks if each field is readable and returns only readable fields"
+  [fields]
+  (for [field (hydrate fields :table)
+        :when (i/can-read? field)]
+    (dissoc field :table)))
+
+(defn with-targets
+  "Efficiently hydrate the FK target fields for a collection of FIELDS."
+  {:batched-hydrate :target}
+  [fields]
+  (let [target-field-ids (set (for [field fields
+                                    :when (and (isa? (:special_type field) :type/FK)
+                                               (:fk_target_field_id field))]
+                                (:fk_target_field_id field)))
+        id->target-field (u/key-by :id (when (seq target-field-ids)
+                                         (readable-fields-only (db/select Field :id [:in target-field-ids]))))]
+    (for [field fields
+          :let  [target-id (:fk_target_field_id field)]]
+      (assoc field :target (id->target-field target-id)))))
+
+
+(defn qualified-name-components
   "Return the pieces that represent a path to FIELD, of the form `[table-name parent-fields-name* field-name]`."
-  [{:keys [table parent], :as field}]
-  {:pre [(delay? table)]}
-  (conj (if parent
-          (qualified-name-components @parent)
-          [(:name @table)])
-        (:name field)))
+  [{field-name :name, table-id :table_id, parent-id :parent_id}]
+  (conj (vec (if-let [parent (Field parent-id)]
+               (qualified-name-components parent)
+               (let [{table-name :name, schema :schema} (db/select-one ['Table :name :schema], :id table-id)]
+                 (conj (when schema
+                         [schema])
+                       table-name))))
+        field-name))
+
+(defn qualified-name
+  "Return a combined qualified name for FIELD, e.g. `table_name.parent_field_name.field_name`."
+  [field]
+  (str/join \. (qualified-name-components field)))
+
+(defn table
+  "Return the `Table` associated with this `Field`."
+  {:arglists '([field])}
+  [{:keys [table_id]}]
+  (db/select-one 'Table, :id table_id))
+
+(defn unix-timestamp?
+  "Is field a UNIX timestamp?"
+  [{:keys [base_type special_type]}]
+  (and (isa? base_type :type/Integer)
+       (isa? special_type :type/Temporal)))

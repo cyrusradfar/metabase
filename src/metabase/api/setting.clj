@@ -1,34 +1,38 @@
 (ns metabase.api.setting
   "/api/setting endpoints"
-  (:require [compojure.core :refer [GET PUT DELETE]]
-            [metabase.api.common :refer :all]
-            (metabase.models [setting :as setting])))
+  (:require [compojure.core :refer [GET PUT]]
+            [metabase.api.common :as api]
+            [metabase.models.setting :as setting]
+            [metabase.util.schema :as su]))
 
-(defendpoint GET "/"
-  "Get all `Settings` and their values. Superusers get all settings, normal users get public settings only."
+(api/defendpoint GET "/"
+  "Get all `Settings` and their values. You must be a superuser to do this."
   []
-  (check-superuser)
-  (setting/all-with-descriptions))
+  (api/check-superuser)
+  (setting/all))
 
-(defendpoint GET "/:key"
+(api/defendpoint PUT "/"
+  "Update multiple `Settings` values.  You must be a superuser to do this."
+  [:as {settings :body}]
+  (api/check-superuser)
+  (setting/set-many! settings)
+  api/generic-204-no-content)
+
+(api/defendpoint GET "/:key"
   "Fetch a single `Setting`. You must be a superuser to do this."
   [key]
-  {key Required}
-  (check-superuser)
-  (setting/get (keyword key)))
+  {key su/NonBlankString}
+  (api/check-superuser)
+  (setting/user-facing-value key))
 
-(defendpoint PUT "/:key"
-  "Create/update a `Setting`. You must be a superuser to do this."
-  [key  :as {{:keys [value]} :body}]
-  {key Required, value Required}
-  (check-superuser)
-  (setting/set (keyword key) value))
+(api/defendpoint PUT "/:key"
+  "Create/update a `Setting`. You must be a superuser to do this.
+   This endpoint can also be used to delete Settings by passing `nil` for `:value`."
+  [key :as {{:keys [value]} :body}]
+  {key su/NonBlankString}
+  (api/check-superuser)
+  (setting/set! key value)
+  api/generic-204-no-content)
 
-(defendpoint DELETE "/:key"
-  "Delete a `Setting`. You must be a superuser to do this."
-  [key]
-  {key Required}
-  (check-superuser)
-  (setting/delete (keyword key)))
 
-(define-routes)
+(api/define-routes)

@@ -1,25 +1,32 @@
 (ns metabase.api.tiles
-  (:require [clojure.core.match :refer [match]]
+  "`/api/tiles` endpoints."
+  (:require [cheshire.core :as json]
             [compojure.core :refer [GET]]
-            [metabase.api.common :refer :all]
-            [metabase.db :refer :all]
-            [metabase.driver :as driver]
-            [metabase.util :as u])
+            [metabase
+             [query-processor :as qp]
+             [util :as u]]
+            [metabase.api.common :as api]
+            [metabase.mbql
+             [normalize :as normalize]
+             [util :as mbql.u]]
+            [metabase.util
+             [i18n :refer [tru]]
+             [schema :as su]])
   (:import java.awt.Color
            java.awt.image.BufferedImage
-           (java.io ByteArrayOutputStream IOException)
+           [java.io ByteArrayInputStream ByteArrayOutputStream]
            javax.imageio.ImageIO))
 
-;;; # ------------------------------------------------------------ CONSTANTS ------------------------------------------------------------
+;;; --------------------------------------------------- CONSTANTS ----------------------------------------------------
 
 (def ^:private ^:const tile-size             256.0)
 (def ^:private ^:const pixel-origin          (float (/ tile-size 2)))
-(def ^:private ^:const pin-size              5)
+(def ^:private ^:const pin-size              6)
 (def ^:private ^:const pixels-per-lon-degree (float (/ tile-size 360)))
 (def ^:private ^:const pixels-per-lon-radian (float (/ tile-size (* 2 Math/PI))))
 
 
-;;; # ------------------------------------------------------------ UTIL FNS ------------------------------------------------------------
+;;; ---------------------------------------------------- UTIL FNS ----------------------------------------------------
 
 (defn- degrees->radians ^double [^double degrees]
   (* degrees (/ Math/PI 180.0)))
@@ -28,7 +35,7 @@
   (/ radians (/ Math/PI 180.0)))
 
 
-;;; # ------------------------------------------------------------ QUERY FNS ------------------------------------------------------------
+;;; --------------------------------------------------- QUERY FNS ----------------------------------------------------
 
 (defn- x+y+zoom->lat-lon
   "Get the latitude & longitude of the upper left corner of a given tile."
@@ -47,21 +54,24 @@
   [details lat-field-id lon-field-id x y zoom]
   (let [top-left      (x+y+zoom->lat-lon      x       y  zoom)
         bottom-right  (x+y+zoom->lat-lon (inc x) (inc y) zoom)
-        inside-filter ["INSIDE" lat-field-id lon-field-id (top-left :lat) (top-left :lon) (bottom-right :lat) (bottom-right :lon)]]
-    (update details :filter
-      #(match %
-         ["AND" & _]              (conj % inside-filter)
-         [(_ :guard string?) & _] (conj ["AND"] % inside-filter)
-         :else                    inside-filter))))
+        inside-filter [:inside
+                       [:field-id lat-field-id]
+                       [:field-id lon-field-id]
+                       (top-left :lat)
+                       (top-left :lon)
+                       (bottom-right :lat)
+                       (bottom-right :lon)]]
+    (update details :filter mbql.u/combine-filter-clauses inside-filter)))
 
 
-;;; # ------------------------------------------------------------ RENDERING ------------------------------------------------------------
+;;; --------------------------------------------------- RENDERING ----------------------------------------------------
 
 (defn- ^BufferedImage create-tile [zoom points]
   (let [num-tiles (bit-shift-left 1 zoom)
         tile      (BufferedImage. tile-size tile-size (BufferedImage/TYPE_INT_ARGB))
-        graphics  (.getGraphics tile)]
-    (.setColor graphics Color/red)
+        graphics  (.getGraphics tile)
+        color-blue (new Color 76 157 230)
+        color-white (Color/white)]
     (try
       (doseq [[^double lat, ^double lon] points]
         (let [sin-y      (-> (Math/sin (degrees->radians lat))
@@ -79,53 +89,84 @@
               tile-pixel {:x (mod (map-pixel :x) tile-size)
                           :y (mod (map-pixel :y) tile-size)}]
           ;; now draw a "pin" at the given tile pixel location
-          (.fillOval graphics (tile-pixel :x) (tile-pixel :y) pin-size pin-size)))
+          (.setColor graphics color-white)
+          (.fillRect graphics (tile-pixel :x) (tile-pixel :y) pin-size pin-size)
+          (.setColor graphics color-blue)
+          (.fillRect graphics (inc (tile-pixel :x)) (inc (tile-pixel :y)) (- pin-size 2) (- pin-size 2))))
       (catch Throwable e
         (.printStackTrace e))
       (finally
         (.dispose graphics)))
     tile))
 
-(defn- tile->byte-array [^BufferedImage tile]
+(defn- tile->byte-array ^bytes [^BufferedImage tile]
   (let [output-stream (ByteArrayOutputStream.)]
     (try
-      (do (ImageIO/write tile "png" output-stream) ; wrap this in a do or eastwood complains about unused return values
-          (.flush output-stream)
-          (.toByteArray output-stream))
-      (catch IOException e
+      (when-not (ImageIO/write tile "png" output-stream) ; returns `true` if successful -- see JavaDoc
+        (throw (Exception. (tru "No appropriate image writer found!"))))
+      (.flush output-stream)
+      (.toByteArray output-stream)
+      (catch Throwable e
         (byte-array 0)) ; return empty byte array if we fail for some reason
       (finally
-        (try
-          (.close output-stream)
-          (catch Throwable _))))))
+        (u/ignore-exceptions
+          (.close output-stream))))))
 
 
-;;; # ------------------------------------------------------------ ENDPOINT ------------------------------------------------------------
 
-(defendpoint GET "/:zoom/:x/:y/:lat-field/:lon-field/:lat-col-idx/:lon-col-idx/"
-  "This endpoints provides an image with the appropriate pins rendered given a json query.
-   We evaluate the query and find the set of lat/lon pairs which are relevant and then render the appropriate ones.
-   It's expected that to render a full map view several calls will be made to this endpoint in parallel."
-  [zoom x y lat-field lon-field lat-col-idx lon-col-idx query :as request]
-  {zoom        String->Integer
-   x           String->Integer
-   y           String->Integer
-   lat-field   String->Integer
-   lon-field   String->Integer
-   lat-col-idx String->Integer
-   lon-col-idx String->Integer
-   query       String->Dict}
-  (let [updated-query (update query :query #(query-with-inside-filter % lat-field lon-field x y zoom))
-        result        (driver/dataset-query updated-query {:executed_by   *current-user-id*
-                                                           :synchronously true})
-        points        (for [row (-> result :data :rows)]
-                        [(nth row lat-col-idx) (nth row lon-col-idx)])]
+;;; ---------------------------------------------------- ENDPOINT ----------------------------------------------------
+
+;; TODO - this can be reworked to be `defendpoint-async` instead
+;;
+;; TODO - this should reduce results from the QP in a streaming fashion instead of requiring them all to be in memory
+;; at the same time
+(api/defendpoint GET "/:zoom/:x/:y/:lat-field-id/:lon-field-id/:lat-col-idx/:lon-col-idx/"
+  "This endpoints provides an image with the appropriate pins rendered given a MBQL `query` (passed as a GET query
+  string param). We evaluate the query and find the set of lat/lon pairs which are relevant and then render the
+  appropriate ones. It's expected that to render a full map view several calls will be made to this endpoint in
+  parallel."
+  [zoom x y lat-field-id lon-field-id lat-col-idx lon-col-idx query]
+  {zoom         su/IntString
+   x            su/IntString
+   y            su/IntString
+   lat-field-id su/IntGreaterThanZero
+   lon-field-id su/IntGreaterThanZero
+   lat-col-idx  su/IntString
+   lon-col-idx  su/IntString
+   query        su/JSONString}
+  (let [zoom          (Integer/parseInt zoom)
+        x             (Integer/parseInt x)
+        y             (Integer/parseInt y)
+        lat-col-idx   (Integer/parseInt lat-col-idx)
+        lon-col-idx   (Integer/parseInt lon-col-idx)
+
+        query
+        (normalize/normalize (json/parse-string query keyword))
+
+        updated-query
+        (-> query
+            (update :query query-with-inside-filter lat-field-id lon-field-id x y zoom)
+            (assoc :async? false))
+
+        {:keys [status], {:keys [rows]} :data, :as result}
+        (qp/process-query-and-save-execution! updated-query
+                                              {:executed-by api/*current-user-id*
+                                               :context     :map-tiles})
+
+        ;; make sure query completed successfully, or API endpoint should return 400
+        _
+        (when-not (= status :completed)
+          (throw (ex-info (tru "Query failed")
+                   ;; `result` might be a `core.async` channel or something we're not expecting
+                   (assoc (when (map? result) result) :status-code 400))))
+
+        points
+        (for [row rows]
+          [(nth row lat-col-idx) (nth row lon-col-idx)])]
     ;; manual ring response here.  we simply create an inputstream from the byte[] of our image
     {:status  200
      :headers {"Content-Type" "image/png"}
-     :body    (-> (create-tile zoom points)
-                  tile->byte-array
-                  java.io.ByteArrayInputStream.)}))
+     :body    (ByteArrayInputStream. (tile->byte-array (create-tile zoom points)))}))
 
 
-(define-routes)
+(api/define-routes)

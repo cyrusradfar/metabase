@@ -1,100 +1,61 @@
 (ns metabase.test.data.mysql
   "Code for creating / destroying a MySQL database from a `DatabaseDefinition`."
-  (:require [clojure.java.jdbc :as jdbc]
-            [clojure.tools.logging :as log]
-            [environ.core :refer [env]]
-            (korma [core :as k]
-                   [db :as kdb])
-            (metabase.test.data [generic-sql :as generic]
-                                [interface :refer :all]))
-  (:import (metabase.test.data.interface DatabaseDefinition
-                                         FieldDefinition
-                                         TableDefinition)))
+  (:require [metabase.test.data
+             [interface :as tx]
+             [sql :as sql.tx]
+             [sql-jdbc :as sql-jdbc.tx]]
+            [metabase.test.data.sql-jdbc
+             [execute :as execute]
+             [load-data :as load-data]]))
 
-(def ^:private ^:const field-base-type->sql-type
-  {:BigIntegerField "BIGINT"
-   :BooleanField    "BOOLEAN" ; Synonym of TINYINT(1)
-   :CharField       "VARCHAR(254)"
-   :DateField       "DATE"
-   :DateTimeField   "TIMESTAMP"
-   :DecimalField    "DECIMAL"
-   :FloatField      "DOUBLE"
-   :IntegerField    "INTEGER"
-   :TextField       "TEXT"
-   :TimeField       "TIME"})
+(sql-jdbc.tx/add-test-extensions! :mysql)
 
-(defn- mysql-connection-details [^DatabaseDefinition {:keys [short-lived?]}]
-  {:host         "localhost"
-   :port         3306
-   :short-lived? short-lived?
-   :user         (if (env :circleci) "ubuntu"
-                     "root")})
+(doseq [[base-type database-type] {:type/BigInteger     "BIGINT"
+                                   :type/Boolean        "BOOLEAN"
+                                   :type/Date           "DATE"
+                                   ;; (3) is fractional seconds precision, i.e. millisecond precision
+                                   :type/DateTime       "DATETIME(3)"
+                                   ;; MySQL is extra dumb and can't have two `TIMESTAMP` columns without default
+                                   ;; values — see
+                                   ;; https://stackoverflow.com/questions/11601034/unable-to-create-2-timestamp-columns-in-1-mysql-table.
+                                   ;; They also have to have non-zero values. See also
+                                   ;; https://dba.stackexchange.com/questions/6171/invalid-default-value-for-datetime-when-changing-to-utf8-general-ci
+                                   :type/DateTimeWithTZ "TIMESTAMP(3) DEFAULT '1970-01-01 00:00:01'"
+                                   :type/Decimal        "DECIMAL"
+                                   :type/Float          "DOUBLE"
+                                   :type/Integer        "INTEGER"
+                                   :type/Text           "TEXT"
+                                   :type/Time           "TIME(3)"}]
+  (defmethod sql.tx/field-base-type->sql-type [:mysql base-type] [_ _] database-type))
 
-(defn- db-connection-details [^DatabaseDefinition database-definition]
-  (assoc (mysql-connection-details database-definition)
-         :db (:database-name database-definition)))
+(defmethod tx/dbdef->connection-details :mysql
+  [_ context {:keys [database-name]}]
+  (merge
+   {:host (tx/db-test-env-var-or-throw :mysql :host "localhost")
+    :port (tx/db-test-env-var-or-throw :mysql :port 3306)
+    :user (tx/db-test-env-var :mysql :user "root")}
+   (when-let [password (tx/db-test-env-var :mysql :password)]
+     {:password password})
+   (when (= context :db)
+     {:db database-name})))
 
-(defn- execute! [scope ^DatabaseDefinition database-definition & format-strings]
-  (jdbc/execute! (-> ((case scope
-                        :mysql mysql-connection-details
-                        :db    db-connection-details) database-definition)
-                     kdb/mysql
-                     (assoc :make-pool? false))
-                 [(apply format format-strings)]
-                 :transaction? false))
+(defmethod tx/aggregate-column-info :mysql
+  ([driver ag-type]
+   ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type))
 
+  ([driver ag-type field]
+   (merge
+    ((get-method tx/aggregate-column-info ::tx/test-extensions) driver ag-type field)
+    (when (= ag-type :sum)
+      {:base_type :type/Decimal}))))
 
-(defrecord MySQLDatasetLoader []
-  generic/IGenericSQLDatasetLoader
-  (generic/execute-sql! [_ database-definition raw-sql]
-    (log/debug raw-sql)
-    (execute! :db database-definition raw-sql))
+;; TODO - we might be able to do SQL all at once by setting `allowMultiQueries=true` on the connection string
+(defmethod execute/execute-sql! :mysql
+  [& args]
+  (apply execute/sequentially-execute-sql! args))
 
-  (generic/korma-entity [_ database-definition table-definition]
-    (-> (k/create-entity (:table-name table-definition))
-        (k/database (-> (db-connection-details database-definition)
-                        kdb/mysql
-                        (assoc :make-pool? false)
-                        kdb/create-db))))
+(defmethod load-data/load-data! :mysql
+  [& args]
+  (apply load-data/load-data-all-at-once! args))
 
-  (generic/pk-sql-type   [_] "INTEGER NOT NULL AUTO_INCREMENT")
-  (generic/pk-field-name [_] "id")
-
-  (generic/field-base-type->sql-type [_ field-type]
-    (if (map? field-type) (:native field-type)
-        (field-base-type->sql-type field-type))))
-
-(extend-protocol IDatasetLoader
-  MySQLDatasetLoader
-  (engine [_]
-    :mysql)
-
-  (database->connection-details [_ database-definition]
-    (assoc (db-connection-details database-definition)
-           :timezone :America/Los_Angeles))
-
-  (drop-physical-db! [_ database-definition]
-    (execute! :mysql database-definition "DROP DATABASE IF EXISTS `%s`;" (:database-name database-definition)))
-
-  (drop-physical-table! [this database-definition table-definition]
-    (generic/drop-physical-table! this database-definition table-definition))
-
-  (create-physical-table! [this database-definition table-definition]
-    (generic/create-physical-table! this database-definition table-definition))
-
-  (create-physical-db! [this database-definition]
-    (drop-physical-db! this database-definition)
-    (execute! :mysql database-definition "CREATE DATABASE `%s`;" (:database-name database-definition))
-
-    ;; double check that we can connect to the newly created DB
-    (metabase.driver/can-connect-with-details? :mysql (db-connection-details database-definition) :rethrow-exceptions)
-
-    ;; call the generic implementation to create Tables + FKs
-    (generic/create-physical-db! this database-definition))
-
-  (load-table-data! [this database-definition table-definition]
-    (generic/load-table-data! this database-definition table-definition)))
-
-
-(defn dataset-loader []
-  (map->MySQLDatasetLoader {:quote-character \`}))
+(defmethod sql.tx/pk-sql-type :mysql [_] "INTEGER NOT NULL AUTO_INCREMENT")

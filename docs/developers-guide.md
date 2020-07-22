@@ -1,32 +1,47 @@
+**This guide will teach you:**
 
-> **This guide will teach you:**
-> How to compile your own copy of Metabase
-> How to set up a development environment
-> How to run the Metabase Server
-> How to contribute back to the Metabase project
+- [How to compile your own copy of Metabase](#build-metabase)
+- [How to set up a development environment](#development-environment)
+- [How to run the Metabase Server](#development-server-quick-start)
+- [How to contribute back to the Metabase project](#contributing)
+- [How to add support in Metabase for other languages](#internationalization)
 
+# Contributing
+
+In general, we like to have an open issue for every pull request as a place to discuss the nature of any bug or proposed improvement. Each pull request should address a single issue, and contain both the fix as well as a description of how the pull request and tests that validate that the PR fixes the issue in question.
+
+For significant feature additions, it is expected that discussion will have taken place in the attached issue. Any feature that requires a major decision to be reached will need to have an explicit design document written. The goals of this document are to make explicit the assumptions, constraints and tradeoffs any given feature implementation will contain. The point is not to generate documentation but to allow discussion to reference a specific proposed design and to allow others to consider the implications of a given design.
+
+We don't like getting sued, so before merging any pull request, we'll need each person contributing code to sign a Contributor License Agreement [here](https://docs.google.com/a/metabase.com/forms/d/1oV38o7b9ONFSwuzwmERRMi9SYrhYeOrkbmNaq9pOJ_E/viewform)
+
+# Development on Windows
+
+The development scripts are designed for Linux/Mac environment, so we recommend using the latest Windows 10 version with [WSL (Windows Subsystem for Linux)](https://msdn.microsoft.com/en-us/commandline/wsl/about) and [Ubuntu on Windows](https://www.microsoft.com/store/p/ubuntu/9nblggh4msv6). The Ubuntu Bash shell works well for both backend and frontend development.
+
+If you have problems with your development environment, make sure that you are not using any development commands outside the Bash shell. As an example, Node dependencies installed in normal Windows environment will not work inside Ubuntu Bash environment.
 
 # Install Prerequisites
 
-These are the set of tools which are required in order to complete any build of the Metabase code.  Follow the links to download and install them on your own before continuing.
+These are the set of tools which are required in order to complete any build of the Metabase code. Follow the links to download and install them on your own before continuing.
 
-1. Oracle JDK 8 (http://www.oracle.com/technetwork/java/javase/downloads/index.html)
-2. Node.js for npm (http://nodejs.org/)
-3. Leiningen (http://leiningen.org/)
+1. [Oracle JDK 8 (http://www.oracle.com/technetwork/java/javase/downloads/index.html)](http://www.oracle.com/technetwork/java/javase/downloads/index.html)
+2. [Node.js (http://nodejs.org/)](http://nodejs.org/)
+3. [Yarn package manager for Node.js](https://yarnpkg.com/)
+4. [Leiningen (http://leiningen.org/)](http://leiningen.org/)
 
+If you are developing on Windows, make sure to use Ubuntu on Windows and follow instructions for Ubuntu/Linux instead of installing ordinary Windows versions.
 
 # Build Metabase
 
-The entire Metabase application is compiled and assembled into a single .jar file which can run on any modern JVM.  There is a script which will execute all steps in the process and output the final artifact for you.
+The entire Metabase application is compiled and assembled into a single .jar file which can run on any modern JVM. There is a script which will execute all steps in the process and output the final artifact for you.
 
     ./bin/build
 
 After running the build script simply look in `target/uberjar` for the output .jar file and you are ready to go.
 
-## Building the OS X App
+## Building `Metabase.app`
 
 See [this guide](developers-guide-osx.md).
-
 
 # Development Environment
 
@@ -43,13 +58,11 @@ Both components are built and assembled together into a single jar file which ru
 
 ### 3rd party dependencies
 
-Metabase depends on lots of other 3rd party libraries to run, so as you are developing you'll need to keep those up to date.  These don't run automatically during development, so kick them off manually when needed.
+Metabase depends on lots of other 3rd party libraries to run, so as you are developing you'll need to keep those up to date. Leiningen will automatically fetch Clojure dependencies when needed, but for JavaScript dependencies you'll need to kick off the installation process manually when needed.
 
 ```sh
-# clojure dependencies
-$ lein deps
 # javascript dependencies
-$ npm install
+$ yarn
 ```
 
 ### Development server (quick start)
@@ -60,30 +73,28 @@ Run your backend development server with
 
 Start the frontend build process with
 
-    npm run build-hot
-
-This will get you a full development server running on port :3000 by default.
-
+    yarn build-hot
 
 ## Frontend development
+
 We use these technologies for our FE build process to allow us to use modules, es6 syntax, and css variables.
 
 - webpack
 - babel
 - cssnext
 
-Frontend tasks are managed by `npm`. All available tasks can be found in `package.json` under *scripts*.
+Frontend tasks are executed using `yarn`. All available tasks can be found in `package.json` under _scripts_.
 
 To build the frontend client without watching for changes, you can use:
 
 ```sh
-$ npm run build
+$ yarn build
 ```
 
 If you're working on the frontend directly, you'll most likely want to reload changes on save, and in the case of React components, do so while maintaining state. To start a build with hot reloading, use:
 
 ```sh
-$ npm run build-hot
+$ yarn build-hot
 ```
 
 Note that at this time if you change CSS variables, those changes will only be picked up when a build is restarted.
@@ -91,28 +102,162 @@ Note that at this time if you change CSS variables, those changes will only be p
 There is also an option to reload changes on save without hot reloading if you prefer that.
 
 ```sh
-$ npm run build-watch
+$ yarn build-watch
 ```
 
-#### Unit Tests / Linting
+Some systems may have trouble detecting changes to frontend files. You can enable filesystem polling by uncommenting the `watchOptions` clause in `webpack.config.js`. If you do this it may be worth making git ignore changes to webpack config, using `git update-index --assume-unchanged webpack.config.js`
 
-Run unit tests with
+### Frontend testing
 
-    npm run test             # Karma
-    npm run test-e2e         # Protractor
+All frontend tests are located in `frontend/test` directory. Run all frontend tests with
 
-Run the linters with
+```
+yarn test
+```
 
-    npm run lint
+which will run unit, end-to-end, and legacy Karma browser tests in sequence.
 
+### End-to-end tests
+
+End-to-end tests simulate realistic sequences of user interactions. They render a complete DOM tree using [Enzyme](http://airbnb.io/enzyme/docs/api/index.html) and use temporary backend instances for executing API calls.
+
+End-to-end tests use an enforced file naming convention `<test-suite-name>.e2e.spec.js` to separate them from unit tests.
+
+Useful commands:
+
+```bash
+lein run refresh-integration-test-db-metadata # Scan the sample dataset and re-run sync/classification/field values caching
+yarn test-e2e-watch # Watches for file changes and runs the tests that have changed
+yarn test-e2e-watch TestFileName # Watches the files in paths that match the given (regex) string
+```
+
+The way integration tests are written is a little unconventional so here is an example that hopefully helps in getting up to speed:
+
+```
+import {
+    useSharedAdminLogin,
+    createTestStore,
+} from "__support__/e2e";
+import {
+    click
+} from "__support__/enzyme"
+
+import { mount } from "enzyme"
+
+import { FETCH_DATABASES } from "metabase/redux/metadata";
+import { INITIALIZE_QB } from "metabase/query_builder/actions";
+import RunButton from "metabase/query_builder/components/RunButton";
+
+describe("Query builder", () => {
+    beforeAll(async () => {
+        // Usually you want to test stuff where user is already logged in
+        // so it is convenient to login before any test case.
+        useSharedAdminLogin()
+    })
+
+    it("should let you run a new query", async () => {
+        // Create a superpowered Redux store.
+        // Remember `await` here!
+        const store = await createTestStore()
+
+        // Go to a desired path in the app. This is safest to do before mounting the app.
+        store.pushPath('/question')
+
+        // Get React container for the whole app and mount it using Enzyme
+        const app = mount(store.getAppContainer())
+
+        // Usually you want to wait until the page has completely loaded, and our way to do that is to
+        // wait until the completion of specified Redux actions. `waitForActions` is also useful for verifying that
+        // specific operations are properly executed after user interactions.
+        // Remember `await` here!
+        await store.waitForActions([FETCH_DATABASES, INITIALIZE_QB])
+
+        // You can use `enzymeWrapper.debug()` to see what is the state of DOM tree at the moment
+        console.log(app.debug())
+
+        // You can use `testStore.debug()` method to see which Redux actions have been dispatched so far.
+        // Note that as opposed to Enzyme's debugging method, you don't need to wrap the call to `console.log()`.
+        store.debug();
+
+        // For simulating user interactions like clicks and input events you should use methods defined
+        // in `enzyme.js` as they abstract away some React/Redux complexities.
+        click(app.find(RunButton))
+
+        // Note: In pretty rare cases where rendering the whole app is problematic or slow, you can just render a single
+        // React container instead with `testStore.connectContainer(container)`. In that case you are not able
+        // to click links that lead to other router paths.
+    });
+})
+```
+
+You can also skim through [`__support__/e2e.js`](https://github.com/metabase/metabase/blob/master/frontend/test/__support__/e2e.js) and [`__support__/enzyme.js`](https://github.com/metabase/metabase/blob/master/frontend/test/__support__/enzyme.js) to see all available methods.
+
+### Jest unit tests
+
+Unit tests are focused around isolated parts of business logic.
+
+Unit tests use an enforced file naming convention `<test-suite-name>.unit.spec.js` to separate them from end-to-end and integration tests.
+
+```
+yarn test-unit # Run all tests at once
+yarn test-unit-watch # Watch for file changes
+```
+
+### Karma browser tests
+
+If you need to test code which uses browser APIs that are only available in real browsers, you can add a Karma test to `frontend/test/legacy-karma` directory.
+
+```
+yarn test-karma # Run all tests once
+yarn test-karma-watch # Watch for file changes
+```
 
 ## Backend development
-Leiningen and your REPL are the main development tools for the backend.  There are some directions below on how to setup your REPL for easier development.
+
+Leiningen and your REPL are the main development tools for the backend. There are some directions below on how to setup your REPL for easier development.
 
 And of course your Jetty development server is available via
 
+    lein run
+
+To automatically load backend namespaces when files are changed, you can instead run with
+
     lein ring server
 
+`lein ring server` takes significantly longer to launch than `lein run`, so if you aren't working on backend code we'd recommend sticking to launching with `lein run`.
+
+### Building drivers
+
+Most of the drivers Metabase uses to connect to external data warehouse databases are separate Leiningen projects under the `modules/` subdirectory. When running Metabase via `lein`, you'll
+need to build these drivers in order to have access to them. You can build drivers as follows:
+
+```
+# Build the 'mongo' driver
+./bin/build-driver.sh mongo
+```
+
+(or)
+
+```
+# Build all drivers
+./bin/build-drivers.sh
+```
+
+The first time you build a driver, it will be a bit slow, because Metabase needs to build the core project a couple of times so the driver can use it as a dependency; you can take comfort in the
+fact that you won't need to build the driver again after that. Alternatively, running Metabase 1.0+ from the uberjar will unpack all of the pre-built drivers into your plugins directory; you can
+do this instead if you already have a Metabase uberjar (just make sure `plugins` is in the root directory of the Metabase source, i.e. the same directory as `project.clj`).
+
+### Including driver source paths for development or other Leiningen tasks
+
+For development when running various Leiningen tasks you can add the `include-all-drivers` profile to merge the drivers' dependencies and source paths into the Metabase
+project:
+
+```
+# Install dependencies
+lein with-profiles +include-all-drivers deps
+```
+
+This profile is added by default when running `lein repl`, tests, and linters.
 
 #### Unit Tests / Linting
 
@@ -124,47 +269,15 @@ or a specific test with
 
     lein test metabase.api.session-test
 
-By default, the tests only run against the `h2` dataset (built-in test database). You can specify which datasets/drivers to run tests against with the env var `MB_TEST_DATASETS`:
+By default, the tests only run against the `h2` driver. You can specify which drivers to run tests against with the env var `DRIVERS`:
 
-    MB_TEST_DATASETS=h2,postgres,mysql,mongo lein test
+    DRIVERS=h2,postgres,mysql,mongo lein test
 
-At the time of this writing, the valid datasets are `h2`, `postgres`, `mysql`, and `mongo`.
+Some drivers require additional environment variables when testing since they are impossible to run locally (such as Redshift and Bigquery). The tests will fail on launch and let you know what parameters to supply if needed.
 
-Run the linters with
+##### Run the linters:
 
-    lein eastwood                        # Clojure linters
-    lein bikeshed --max-line-length 240
-
-
-#### Bootstrapping (for REPL)
-
-To quickly get your dev environment set up, use the `bootstrap` function to create a new User and Organization.
-Open a REPL in Emacs or with `lein repl` and enter the following:
-
-```clojure
-(use 'metabase.db)
-(setup-db)
-(use 'metabase.bootstrap)
-(bootstrap)
-```
-
-You'll be walked through the steps to get started.
-
-#### API Client (for REPL)
-
-You can make API calls from the REPL using `metabase.http-client`:
-
-```clojure
-(use 'metabase.http-client)
-(defn cl [& args]
-  (-> (apply client {:email "crowberto@metabase.com", :password "squawk"} args)
-      clojure.pprint/pprint))
-(cl :get "user/current")
-;; -> {:email "crowbetro@metabase.com",
-;;     :first_name "Crowbero",
-;;     :last_login #inst "2015-03-13T22:55:05.390000000-00:00",
-;;     ...}
-```
+    lein eastwood && lein bikeshed && lein docstring-checker && lein check-namespace-decls && ./bin/reflection-linter
 
 #### Developing with Emacs
 
@@ -180,96 +293,35 @@ You'll probably want to tell Emacs to store customizations in a different file. 
   (load-file custom-file))
 ```
 
-#### Checking for Out-of-Date Dependencies
-
-    lein ancient                   # list all out-of-date dependencies
-    lein ancient latest lein-ring  # list latest version of artifact lein-ring
-
-Will give you a list of out-of-date dependencies.
-
-Once's this repo is made public, this Clojars badge will work and show the status as well:
-
-[![Dependencies Status](http://jarkeeper.com/metabase/metabase-init/status.png)](http://jarkeeper.com/metabase/metabase)
-
-
 ## Documentation
 
-#### Instant Cheatsheet
+## Internationalization
 
-Start up an instant cheatsheet for the project + dependencies by running
+We are an application with lots of users all over the world. To help them use Metabase in their own language, we mark all of our strings as i18n.
 
-    lein instant-cheatsheet
+### Adding new strings:
 
-#### Marginalia
+If you need to add new strings (try to be judicious about adding copy) do the following:
 
-You can generate and view documentation with
+1. Tag strings in the frontend using `t` and `jt` ES6 template literals (see more details in https://ttag.js.org/):
 
-    lein marg
-    open ./docs/uberdoc.html
-
-You can update the GitHub pages documentation using
-
-    make dox
-
-You should be on the `master` branch without any uncommited local changes before doing so. Also, make sure you've fetched the branch `gh-pages` and can push it back to `origin`.
-
-
-
-
-# Contributing
-
-In general, we like to have an open issue for every pull request as a place to discuss the nature of any bug or proposed improvement. Each pull request should address a single issue, and contain both the fix as well as a description of how the pull request and tests that validate that the PR fixes the issue in question.
-
-For significant feature additions, it is expected that discussion will have taken place in the attached issue. Any feature that requires a major decision to be reached will need to have an explicit design document written. The goals of this document are to make explicit the assumptions, constraints and tradeoffs any given feature implementation will contain. The point is not to generate documentation but to allow discussion to reference a specific proposed design and to allow others to consider the implications of a given design.
-
-We don't like getting sued, so for every commit we require a Linux Kernel style developer certificate. If you agree to the below terms (from http://developercertificate.org/)
-
-```
-Developer Certificate of Origin
-Version 1.1
-
-Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
-660 York Street, Suite 102,
-San Francisco, CA 94110 USA
-
-Everyone is permitted to copy and distribute verbatim copies of this
-license document, but changing it is not allowed.
-
-Developer's Certificate of Origin 1.1
-
-By making a contribution to this project, I certify that:
-
-(a) The contribution was created in whole or in part by me and I
-    have the right to submit it under the open source license
-    indicated in the file; or
-
-(b) The contribution is based upon previous work that, to the best
-    of my knowledge, is covered under an appropriate open source
-    license and I have the right under that license to submit that
-    work with modifications, whether created in whole or in part
-    by me, under the same open source license (unless I am
-    permitted to submit under a different license), as indicated
-    in the file; or
-
-(c) The contribution was provided directly to me by some other
-    person who certified (a), (b) or (c) and I have not modified
-    it.
-
-(d) I understand and agree that this project and the contribution
-    are public and that a record of the contribution (including all
-    personal information I submit with it, including my sign-off) is
-    maintained indefinitely and may be redistributed consistent with
-    this project or the open source license(s) involved.
+```javascript
+const someString = t`Hello ${name}!`;
+const someJSX = <div>{jt`Hello ${name}`}</div>;
 ```
 
-Then you just add a line to every git commit message:
+and in the backend using `trs` (to use the site language) or `tru` (to use the current User's language):
 
-    Signed-off-by: Helpful Contributor <helpful.contributor@email.com>
+```clojure
+(trs "Hello {0}!" name)
+```
 
-All contributions need to be signed with your real name.
+### Translation errors or missing strings
+
+If you see incorrect or missing strings for your language, please visit our [POEditor project](https://poeditor.com/join/project/ynjQmwSsGh) and submit your fixes there.
 
 ## License
 
-Copyright © 2015 Metabase, Inc
+Copyright © 2020 Metabase, Inc.
 
-Distributed under the terms of the GNU Affero General Public License (AGPL) except as otherwise noted.  See individual files for details.
+Distributed under the terms of the GNU Affero General Public License (AGPL) except as otherwise noted. See individual files for details.
